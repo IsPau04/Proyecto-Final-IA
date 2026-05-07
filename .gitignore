@@ -1,0 +1,17 @@
+.venv/
+.venv-win/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+models/
+data/processed/
+data/augmented/
+
+# Dataset local: se puede entregar por Drive si pesa mucho
+data/raw/
+data/raw_sequences/
+data/external_imports/
+
+.DS_Store
+.vscode/

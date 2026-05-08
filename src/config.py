@@ -4,6 +4,10 @@
 # tamano de los archivos sin perder informacion importante para MFCC o Mel.
 SAMPLE_RATE = 16000
 
+# El modelo se entrena solo con comandos base individuales. Las frases largas o
+# combinaciones de acciones se resolveran despues con un parser de predicciones,
+# no con clases ni carpetas compuestas dentro del dataset de entrenamiento.
+#
 # Las etiquetas internas no tienen espacios ni tildes para que sean estables al
 # usarlas como nombres de carpetas, clases del modelo, claves de diccionarios y
 # valores en archivos CSV/JSON. La frase hablada si puede tener espacios o
@@ -26,30 +30,4 @@ SIMPLE_COMMAND_PHRASES = {
     "CIERRA": "cierra",
     "POSICION_INICIAL": "posicion inicial",
     "RUIDO_FONDO": "ruido fondo",
-}
-
-# Comandos compuestos para el modulo secuencial futuro. La clave identifica la
-# etiqueta compuesta y el valor conserva el orden exacto de acciones simples.
-SEQUENCE_COMMANDS = {
-    "ABRE_Y_CIERRA": ["ABRE", "CIERRA"],
-    "BAJA_Y_ABRE": ["BAJA", "ABRE"],
-    "BAJA_Y_CIERRA": ["BAJA", "CIERRA"],
-    "SUBE_Y_ABRE": ["SUBE", "ABRE"],
-    "SUBE_Y_CIERRA": ["SUBE", "CIERRA"],
-    "ABRE_Y_POSICION_INICIAL": ["ABRE", "POSICION_INICIAL"],
-    "BAJA_Y_ABRE_Y_CIERRA": ["BAJA", "ABRE", "CIERRA"],
-    "SUBE_Y_ABRE_Y_CIERRA": ["SUBE", "ABRE", "CIERRA"],
-}
-
-# Frases naturales esperadas para grabar el dataset secuencial. Las claves se
-# mantienen alineadas con SEQUENCE_COMMANDS para validar etiquetas compuestas.
-SEQUENCE_COMMAND_PHRASES = {
-    "ABRE_Y_CIERRA": "abre y cierra",
-    "BAJA_Y_ABRE": "baja y abre",
-    "BAJA_Y_CIERRA": "baja y cierra",
-    "SUBE_Y_ABRE": "sube y abre",
-    "SUBE_Y_CIERRA": "sube y cierra",
-    "ABRE_Y_POSICION_INICIAL": "abre y posicion inicial",
-    "BAJA_Y_ABRE_Y_CIERRA": "baja y abre y cierra",
-    "SUBE_Y_ABRE_Y_CIERRA": "sube y abre y cierra",
 }

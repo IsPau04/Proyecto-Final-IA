@@ -1,4 +1,4 @@
-"""Extraccion de caracteristicas de audio para comandos de voz."""
+"""Funciones para extraer caracteristicas de audio desde archivos WAV."""
 
 from pathlib import Path
 
@@ -10,27 +10,44 @@ import numpy as np
 from src.config import SAMPLE_RATE
 
 
+# Parametros configurables para mantener consistente la extraccion de
+# caracteristicas durante entrenamiento, validacion e inferencia.
+DEFAULT_N_MELS = 128
+DEFAULT_N_MFCC = 13
+DEFAULT_N_FFT = 2048
+DEFAULT_HOP_LENGTH = 512
+
+
 def load_audio(file_path):
-    """Carga un archivo WAV usando la frecuencia de muestreo del proyecto."""
+    """Carga un archivo WAV mono usando el SAMPLE_RATE definido en src.config."""
     audio, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
     return audio
 
 
 def normalize_audio(audio):
-    """Normaliza la amplitud al rango [-1, 1] sin cambiar la forma de la senal."""
+    """Normaliza la amplitud del audio al rango [-1, 1]."""
     max_amplitude = np.max(np.abs(audio))
 
+    # Si el audio esta vacio o completamente en silencio, se devuelve igual para
+    # evitar divisiones por cero.
     if max_amplitude == 0:
         return audio
 
     return audio / max_amplitude
 
 
-def trim_silence_energy(audio, frame_length=2048, hop_length=512, threshold_ratio=0.1):
-    """Quita silencio al inicio y final usando un VAD basico por energia."""
+def trim_silence_energy(
+    audio,
+    frame_length=DEFAULT_N_FFT,
+    hop_length=DEFAULT_HOP_LENGTH,
+    threshold_ratio=0.1,
+):
+    """Quita silencios al inicio y al final usando un VAD basico por energia."""
     if audio.size == 0:
         return audio
 
+    # RMS estima la energia por ventanas cortas. Las ventanas con energia mayor
+    # al umbral se consideran actividad de voz o sonido util.
     rms_energy = librosa.feature.rms(
         y=audio,
         frame_length=frame_length,
@@ -43,6 +60,8 @@ def trim_silence_energy(audio, frame_length=2048, hop_length=512, threshold_rati
     threshold = np.max(rms_energy) * threshold_ratio
     active_frames = np.flatnonzero(rms_energy > threshold)
 
+    # Si no hay ventanas activas, se conserva el audio original para no perder
+    # ejemplos de RUIDO_FONDO o grabaciones de baja energia.
     if active_frames.size == 0:
         return audio
 
@@ -55,7 +74,12 @@ def trim_silence_energy(audio, frame_length=2048, hop_length=512, threshold_rati
     return audio[start_sample:min(end_sample, len(audio))]
 
 
-def extract_mel_spectrogram(audio, n_mels=128, n_fft=2048, hop_length=512):
+def extract_mel_spectrogram(
+    audio,
+    n_mels=DEFAULT_N_MELS,
+    n_fft=DEFAULT_N_FFT,
+    hop_length=DEFAULT_HOP_LENGTH,
+):
     """Extrae un Mel-Spectrogram de potencia desde la senal de audio."""
     return librosa.feature.melspectrogram(
         y=audio,
@@ -67,18 +91,30 @@ def extract_mel_spectrogram(audio, n_mels=128, n_fft=2048, hop_length=512):
     )
 
 
-def extract_log_mel_spectrogram(audio, n_mels=128, n_fft=2048, hop_length=512):
-    """Convierte el Mel-Spectrogram a escala logaritmica en decibeles."""
+def extract_log_mel_spectrogram(
+    audio,
+    n_mels=DEFAULT_N_MELS,
+    n_fft=DEFAULT_N_FFT,
+    hop_length=DEFAULT_HOP_LENGTH,
+):
+    """Convierte un Mel-Spectrogram de potencia a escala logaritmica."""
     mel_spectrogram = extract_mel_spectrogram(
         audio,
         n_mels=n_mels,
         n_fft=n_fft,
         hop_length=hop_length,
     )
+
     return librosa.power_to_db(mel_spectrogram, ref=np.max)
 
 
-def extract_mfcc(audio, n_mfcc=13, n_mels=128, n_fft=2048, hop_length=512):
+def extract_mfcc(
+    audio,
+    n_mfcc=DEFAULT_N_MFCC,
+    n_mels=DEFAULT_N_MELS,
+    n_fft=DEFAULT_N_FFT,
+    hop_length=DEFAULT_HOP_LENGTH,
+):
     """Extrae coeficientes MFCC desde la senal de audio."""
     return librosa.feature.mfcc(
         y=audio,
@@ -98,10 +134,12 @@ def save_spectrogram_image(log_mel, output_path):
     plt.figure(figsize=(10, 4))
 
     # El espectrograma representa como cambia la energia de las frecuencias a
-    # traves del tiempo: eje X = tiempo, eje Y = bandas Mel, color = energia.
+    # traves del tiempo: el eje X es tiempo, el eje Y son bandas Mel y el color
+    # indica energia en decibeles.
     librosa.display.specshow(
         log_mel,
         sr=SAMPLE_RATE,
+        hop_length=DEFAULT_HOP_LENGTH,
         x_axis="time",
         y_axis="mel",
         cmap="magma",
@@ -109,5 +147,5 @@ def save_spectrogram_image(log_mel, output_path):
     plt.colorbar(format="%+2.0f dB")
     plt.title("Log-Mel Spectrogram")
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.savefig(output_path, format="png", dpi=150, bbox_inches="tight")
     plt.close()

@@ -1,11 +1,11 @@
 {
-  "train_samples": 1663,
-  "validation_samples": 357,
-  "test_samples": 357,
-  "epochs_ran": 20,
-  "best_validation_accuracy": 0.6470588445663452,
-  "best_validation_loss": 0.9322933554649353,
-  "test_loss": 1.0626784563064575,
-  "test_accuracy": 0.5854341983795166,
-  "final_accuracy": 0.5854341736694678
+  "train_samples": 5946,
+  "validation_samples": 1274,
+  "test_samples": 1275,
+  "epochs_ran": 100,
+  "best_validation_accuracy": 0.9803767800331116,
+  "best_validation_loss": 0.0770750418305397,
+  "test_loss": 0.08713022619485855,
+  "test_accuracy": 0.975686252117157,
+  "final_accuracy": 0.9756862745098039
 }

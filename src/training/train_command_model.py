@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow import keras
 from tensorflow.keras import layers
 
@@ -22,6 +23,8 @@ LABELS_PATH = MODELS_DIR / "labels.json"
 TRAINING_METRICS_PATH = DOCS_DIR / "training_metrics.json"
 CLASSIFICATION_REPORT_PATH = DOCS_DIR / "classification_report.txt"
 CONFUSION_MATRIX_PATH = DOCS_DIR / "confusion_matrix.png"
+CONFUSION_MATRIX_NORMALIZED_PATH = DOCS_DIR / "confusion_matrix_normalized.png"
+TRAINING_CURVES_PATH = DOCS_DIR / "training_curves.png"
 RANDOM_STATE = 42
 
 
@@ -47,6 +50,23 @@ def parse_args():
         type=int,
         default=32,
         help="Tamano de batch para entrenamiento.",
+    )
+    parser.add_argument(
+        "--model-output",
+        type=Path,
+        default=MODEL_PATH,
+        help=f"Ruta del modelo entrenado. Default: {MODEL_PATH}",
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=["baseline", "improved_light"],
+        default="baseline",
+        help="Arquitectura del modelo a entrenar. Default: baseline.",
+    )
+    parser.add_argument(
+        "--use-class-weight",
+        action="store_true",
+        help="Activa pesos de clase balanceados durante el entrenamiento.",
     )
     return parser.parse_args()
 
@@ -124,8 +144,18 @@ def normalize_splits(X_train, X_val, X_test):
     return X_train_norm, X_val_norm, X_test_norm, mean, std
 
 
-def build_model(input_shape, num_classes):
-    """Crea una CNN 2D sencilla entrenable desde cero."""
+def compile_model(model):
+    """Compila un modelo con la configuracion comun de entrenamiento."""
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.0005),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+def build_baseline_cnn(input_shape, num_classes):
+    """Crea la CNN 2D baseline original entrenable desde cero."""
     model = keras.Sequential(
         [
             layers.Input(shape=input_shape),
@@ -144,12 +174,50 @@ def build_model(input_shape, num_classes):
             layers.Dense(num_classes, activation="softmax"),
         ]
     )
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
+    return compile_model(model)
+
+
+def build_improved_light_cnn(input_shape, num_classes):
+    """Crea una CNN 2D mejorada moderada entrenable desde cero."""
+    model = keras.Sequential(
+        [
+            layers.Input(shape=input_shape),
+            layers.Conv2D(32, kernel_size=(3, 3), activation="relu", padding="same"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Dropout(0.15),
+            layers.Conv2D(64, kernel_size=(3, 3), activation="relu", padding="same"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Dropout(0.20),
+            layers.Conv2D(96, kernel_size=(3, 3), activation="relu", padding="same"),
+            layers.MaxPooling2D(pool_size=(2, 2)),
+            layers.Dropout(0.25),
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(96, activation="relu"),
+            layers.Dropout(0.30),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
     )
-    return model
+    return compile_model(model)
+
+
+def build_model(input_shape, num_classes, architecture):
+    """Construye el modelo segun la arquitectura solicitada."""
+    builders = {
+        "baseline": build_baseline_cnn,
+        "improved_light": build_improved_light_cnn,
+    }
+    return builders[architecture](input_shape, num_classes)
+
+
+def build_class_weights(y_train):
+    """Calcula pesos de clase balanceados para compensar desbalance del dataset."""
+    classes = np.unique(y_train)
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y_train,
+    )
+    return {int(class_id): float(weight) for class_id, weight in zip(classes, weights)}
 
 
 def save_labels(labels):
@@ -159,7 +227,35 @@ def save_labels(labels):
         json.dump(labels.tolist(), labels_file, ensure_ascii=False, indent=2)
 
 
-def plot_confusion_matrix(matrix, labels):
+def plot_training_curves(history):
+    """Guarda las curvas de accuracy y loss del entrenamiento."""
+    epochs = np.arange(1, len(history.history.get("loss", [])) + 1)
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    axes[0].plot(epochs, history.history.get("accuracy", []), label="accuracy")
+    axes[0].plot(epochs, history.history.get("val_accuracy", []), label="val_accuracy")
+    axes[0].set_xlabel("Epoca")
+    axes[0].set_ylabel("Accuracy")
+    axes[0].set_title("Accuracy")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(epochs, history.history.get("loss", []), label="loss")
+    axes[1].plot(epochs, history.history.get("val_loss", []), label="val_loss")
+    axes[1].set_xlabel("Epoca")
+    axes[1].set_ylabel("Loss")
+    axes[1].set_title("Loss")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    figure.tight_layout()
+    TRAINING_CURVES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(TRAINING_CURVES_PATH, dpi=150)
+    plt.close(figure)
+
+
+def plot_confusion_matrix(matrix, labels, output_path, title, value_format="d"):
     """Guarda la matriz de confusion como imagen PNG."""
     figure, axis = plt.subplots(figsize=(8, 7))
     image = axis.imshow(matrix, interpolation="nearest", cmap="Blues")
@@ -172,26 +268,41 @@ def plot_confusion_matrix(matrix, labels):
     axis.set_yticklabels(labels)
     axis.set_xlabel("Prediccion")
     axis.set_ylabel("Etiqueta real")
-    axis.set_title("Matriz de confusion")
+    axis.set_title(title)
 
     threshold = matrix.max() / 2.0 if matrix.size else 0
     for row_index in range(matrix.shape[0]):
         for column_index in range(matrix.shape[1]):
             value = matrix[row_index, column_index]
             color = "white" if value > threshold else "black"
+            if value_format == "d":
+                label = str(int(value))
+            else:
+                label = format(value, value_format)
             axis.text(
                 column_index,
                 row_index,
-                str(value),
+                label,
                 ha="center",
                 va="center",
                 color=color,
             )
 
     figure.tight_layout()
-    CONFUSION_MATRIX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(CONFUSION_MATRIX_PATH, dpi=150)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=150)
     plt.close(figure)
+
+
+def normalize_confusion_matrix(matrix):
+    """Normaliza la matriz de confusion por fila."""
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    return np.divide(
+        matrix.astype(np.float64),
+        row_sums,
+        out=np.zeros_like(matrix, dtype=np.float64),
+        where=row_sums != 0,
+    )
 
 
 def save_training_metrics(history, test_loss, test_accuracy, final_accuracy, split_sizes):
@@ -220,6 +331,7 @@ def save_training_metrics(history, test_loss, test_accuracy, final_accuracy, spl
 def main():
     args = parse_args()
     dataset_path = resolve_project_path(args.dataset)
+    model_output_path = resolve_project_path(args.model_output)
 
     X, y, labels, file_paths = load_dataset(dataset_path)
     (
@@ -238,10 +350,19 @@ def main():
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    model_output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(PREPROCESS_PARAMS_PATH, mean=mean, std=std)
     save_labels(labels)
 
-    model = build_model(input_shape=X_train.shape[1:], num_classes=len(labels))
+    model = build_model(
+        input_shape=X_train.shape[1:],
+        num_classes=len(labels),
+        architecture=args.architecture,
+    )
+    fit_kwargs = {}
+    if args.use_class_weight:
+        fit_kwargs["class_weight"] = build_class_weights(y_train)
+
     callbacks = [
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
@@ -249,13 +370,22 @@ def main():
             restore_best_weights=True,
         ),
         keras.callbacks.ModelCheckpoint(
-            filepath=MODEL_PATH,
+            filepath=model_output_path,
             monitor="val_loss",
             save_best_only=True,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=4,
+            min_lr=1e-6,
+            verbose=1,
         ),
     ]
 
     print(f"Dataset: {dataset_path}")
+    print(f"Arquitectura: {args.architecture}")
+    print(f"Class weight: {'activado' if args.use_class_weight else 'desactivado'}")
     print(f"Forma de entrada: {X_train.shape[1:]}")
     print(f"Clases: {list(labels)}")
     print(
@@ -271,9 +401,10 @@ def main():
         batch_size=args.batch_size,
         callbacks=callbacks,
         verbose=1,
+        **fit_kwargs,
     )
 
-    best_model = keras.models.load_model(MODEL_PATH)
+    best_model = keras.models.load_model(model_output_path)
     test_loss, test_accuracy = best_model.evaluate(X_test, y_test, verbose=0)
     y_probabilities = best_model.predict(X_test, verbose=0)
     y_pred = np.argmax(y_probabilities, axis=1)
@@ -287,12 +418,27 @@ def main():
         zero_division=0,
     )
     matrix = confusion_matrix(y_test, y_pred, labels=np.arange(len(labels)))
+    normalized_matrix = normalize_confusion_matrix(matrix)
 
     with CLASSIFICATION_REPORT_PATH.open("w", encoding="utf-8") as report_file:
         report_file.write(report)
         report_file.write("\n")
 
-    plot_confusion_matrix(matrix, labels)
+    plot_training_curves(history)
+    plot_confusion_matrix(
+        matrix=matrix,
+        labels=labels,
+        output_path=CONFUSION_MATRIX_PATH,
+        title="Matriz de confusion",
+        value_format="d",
+    )
+    plot_confusion_matrix(
+        matrix=normalized_matrix,
+        labels=labels,
+        output_path=CONFUSION_MATRIX_NORMALIZED_PATH,
+        title="Matriz de confusion normalizada",
+        value_format=".2f",
+    )
     metrics = save_training_metrics(
         history=history,
         test_loss=test_loss,
@@ -310,12 +456,14 @@ def main():
     print(f"  Accuracy final: {metrics['final_accuracy']:.4f}")
     print(f"  Mejor val_accuracy: {metrics['best_validation_accuracy']:.4f}")
     print(f"  Mejor val_loss: {metrics['best_validation_loss']:.4f}")
-    print(f"Modelo guardado en: {MODEL_PATH}")
+    print(f"Modelo guardado en: {model_output_path}")
     print(f"Parametros de normalizacion guardados en: {PREPROCESS_PARAMS_PATH}")
     print(f"Labels guardados en: {LABELS_PATH}")
     print(f"Metricas guardadas en: {TRAINING_METRICS_PATH}")
     print(f"Reporte guardado en: {CLASSIFICATION_REPORT_PATH}")
     print(f"Matriz de confusion guardada en: {CONFUSION_MATRIX_PATH}")
+    print(f"Matriz de confusion normalizada guardada en: {CONFUSION_MATRIX_NORMALIZED_PATH}")
+    print(f"Curvas de entrenamiento guardadas en: {TRAINING_CURVES_PATH}")
 
 
 if __name__ == "__main__":

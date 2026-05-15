@@ -31,14 +31,24 @@ DEFAULT_DURATION = 6.0
 DEFAULT_WINDOW_DURATION = 2.0
 DEFAULT_HOP_DURATION = 0.75
 DEFAULT_THRESHOLD = 0.60
+DEFAULT_ENERGY_THRESHOLD = 0.003
+DEFAULT_SEGMENTATION_MODE = "vad"
+DEFAULT_MIN_SEGMENT_DURATION = 0.35
+DEFAULT_MIN_SILENCE_DURATION = 0.35
+DEFAULT_SEGMENT_PADDING = 0.20
+DEFAULT_MIN_COMMAND_GAP = 0.6
+DEFAULT_MIN_CONFIRMATIONS = 2
+DEFAULT_CONFIRMATION_WINDOW = 1.0
+DEFAULT_HIGH_CONFIDENCE_OVERRIDE = 0.98
+VAD_FRAME_DURATION = 0.030
 
 
 def parse_args():
-    """Define argumentos para detectar comandos en ventanas consecutivas."""
+    """Define argumentos para detectar comandos en audio largo."""
     parser = argparse.ArgumentParser(
         description=(
             "Graba o carga audio y detecta comandos base en orden usando "
-            "ventanas deslizantes."
+            "segmentos de voz o ventanas deslizantes."
         ),
     )
     parser.add_argument(
@@ -72,6 +82,92 @@ def parse_args():
         help=f"Confianza minima para aceptar comandos. Default: {DEFAULT_THRESHOLD}",
     )
     parser.add_argument(
+        "--segmentation-mode",
+        choices=("windows", "vad"),
+        default=DEFAULT_SEGMENTATION_MODE,
+        help=(
+            "Estrategia para dividir el audio antes de clasificar. "
+            f"Default: {DEFAULT_SEGMENTATION_MODE}"
+        ),
+    )
+    parser.add_argument(
+        "--energy-threshold",
+        type=float,
+        default=DEFAULT_ENERGY_THRESHOLD,
+        help=(
+            "Energia RMS minima para activar una ventana o frame VAD. "
+            f"Default: {DEFAULT_ENERGY_THRESHOLD}"
+        ),
+    )
+    parser.add_argument(
+        "--min-segment-duration",
+        type=float,
+        default=DEFAULT_MIN_SEGMENT_DURATION,
+        help=(
+            "Duracion minima de voz para clasificar un segmento en segundos. "
+            f"Default: {DEFAULT_MIN_SEGMENT_DURATION}"
+        ),
+    )
+    parser.add_argument(
+        "--min-silence-duration",
+        type=float,
+        default=DEFAULT_MIN_SILENCE_DURATION,
+        help=(
+            "Silencio minimo para separar dos segmentos de voz en segundos. "
+            f"Default: {DEFAULT_MIN_SILENCE_DURATION}"
+        ),
+    )
+    parser.add_argument(
+        "--segment-padding",
+        type=float,
+        default=DEFAULT_SEGMENT_PADDING,
+        help=(
+            "Contexto agregado antes y despues de cada segmento en segundos. "
+            f"Default: {DEFAULT_SEGMENT_PADDING}"
+        ),
+    )
+    parser.add_argument(
+        "--auto-energy",
+        action="store_true",
+        help="Estima automaticamente el umbral RMS desde el audio.",
+    )
+    parser.add_argument(
+        "--min-command-gap",
+        type=float,
+        default=DEFAULT_MIN_COMMAND_GAP,
+        help=(
+            "Separacion minima en segundos entre comandos aceptados. "
+            f"Default: {DEFAULT_MIN_COMMAND_GAP}"
+        ),
+    )
+    parser.add_argument(
+        "--min-confirmations",
+        type=int,
+        default=DEFAULT_MIN_CONFIRMATIONS,
+        help=(
+            "Cantidad minima de ventanas cercanas con la misma clase para "
+            f"confirmar un comando. Default: {DEFAULT_MIN_CONFIRMATIONS}"
+        ),
+    )
+    parser.add_argument(
+        "--confirmation-window",
+        type=float,
+        default=DEFAULT_CONFIRMATION_WINDOW,
+        help=(
+            "Ventana temporal en segundos para agrupar candidatas cercanas. "
+            f"Default: {DEFAULT_CONFIRMATION_WINDOW}"
+        ),
+    )
+    parser.add_argument(
+        "--high-confidence-override",
+        type=float,
+        default=DEFAULT_HIGH_CONFIDENCE_OVERRIDE,
+        help=(
+            "Confianza minima para aceptar un grupo aunque no alcance las "
+            f"confirmaciones requeridas. Default: {DEFAULT_HIGH_CONFIDENCE_OVERRIDE}"
+        ),
+    )
+    parser.add_argument(
         "--device",
         default=None,
         help="Dispositivo de entrada para sounddevice: indice o nombre parcial.",
@@ -100,6 +196,22 @@ def validate_args(args):
         raise ValueError("--hop-duration debe ser mayor que 0.")
     if not 0 <= args.threshold <= 1:
         raise ValueError("--threshold debe estar entre 0 y 1.")
+    if args.energy_threshold < 0:
+        raise ValueError("--energy-threshold no puede ser negativo.")
+    if args.min_segment_duration <= 0:
+        raise ValueError("--min-segment-duration debe ser mayor que 0.")
+    if args.min_silence_duration < 0:
+        raise ValueError("--min-silence-duration no puede ser negativo.")
+    if args.segment_padding < 0:
+        raise ValueError("--segment-padding no puede ser negativo.")
+    if args.min_command_gap < 0:
+        raise ValueError("--min-command-gap no puede ser negativo.")
+    if args.min_confirmations <= 0:
+        raise ValueError("--min-confirmations debe ser mayor que 0.")
+    if args.confirmation_window < 0:
+        raise ValueError("--confirmation-window no puede ser negativo.")
+    if not 0 <= args.high_confidence_override <= 1:
+        raise ValueError("--high-confidence-override debe estar entre 0 y 1.")
 
 
 def parse_device(device):
@@ -267,6 +379,111 @@ def iter_windows(audio, window_duration, hop_duration):
         start_sample += hop_samples
 
 
+def calculate_rms_energy(audio):
+    """Calcula la energia RMS de una ventana de audio cruda."""
+    if len(audio) == 0:
+        return 0.0
+
+    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float32))))
+
+
+def estimate_energy_threshold(window_energies):
+    """Estima un umbral RMS conservador a partir de energia baja del audio."""
+    if not window_energies:
+        return DEFAULT_ENERGY_THRESHOLD
+
+    noise_estimate = float(np.percentile(window_energies, 25))
+    return max(DEFAULT_ENERGY_THRESHOLD, noise_estimate * 3)
+
+
+def iter_energy_frames(audio, sample_rate, frame_duration=VAD_FRAME_DURATION):
+    """Genera frames cortos para detectar actividad por energia RMS."""
+    frame_samples = max(1, int(round(frame_duration * sample_rate)))
+
+    for start_sample in range(0, len(audio), frame_samples):
+        end_sample = min(start_sample + frame_samples, len(audio))
+        frame_audio = audio[start_sample:end_sample]
+        yield start_sample, end_sample, calculate_rms_energy(frame_audio)
+
+
+def estimate_frame_energy_threshold(audio, sample_rate):
+    """Estima umbral RMS usando frames cortos del audio completo."""
+    frame_energies = [
+        energy
+        for _start_sample, _end_sample, energy in iter_energy_frames(audio, sample_rate)
+    ]
+    return estimate_energy_threshold(frame_energies)
+
+
+def segment_audio_by_energy(
+    audio,
+    sample_rate,
+    energy_threshold,
+    min_segment_duration,
+    min_silence_duration,
+):
+    """Segmenta audio en zonas de voz usando energia RMS por frames de 30 ms."""
+    frames = list(iter_energy_frames(audio, sample_rate))
+    active_segments = []
+    current_start = None
+    current_end = None
+
+    for start_sample, end_sample, energy in frames:
+        is_active = energy >= energy_threshold
+        if is_active and current_start is None:
+            current_start = start_sample
+            current_end = end_sample
+            continue
+
+        if is_active:
+            current_end = end_sample
+            continue
+
+        if current_start is not None:
+            active_segments.append((current_start, current_end))
+            current_start = None
+            current_end = None
+
+    if current_start is not None:
+        active_segments.append((current_start, current_end))
+
+    min_silence_samples = int(round(min_silence_duration * sample_rate))
+    merged_segments = []
+    for start_sample, end_sample in active_segments:
+        if not merged_segments:
+            merged_segments.append([start_sample, end_sample])
+            continue
+
+        previous_start, previous_end = merged_segments[-1]
+        silence_samples = start_sample - previous_end
+        if silence_samples <= min_silence_samples:
+            merged_segments[-1] = [previous_start, end_sample]
+            continue
+
+        merged_segments.append([start_sample, end_sample])
+
+    min_segment_samples = int(round(min_segment_duration * sample_rate))
+    segments = []
+    for start_sample, end_sample in merged_segments:
+        duration_samples = end_sample - start_sample
+        if duration_samples < min_segment_samples:
+            continue
+
+        segment_audio = audio[start_sample:end_sample]
+        segments.append(
+            {
+                "start_sample": start_sample,
+                "end_sample": end_sample,
+                "start": start_sample / sample_rate,
+                "end": end_sample / sample_rate,
+                "duration": duration_samples / sample_rate,
+                "energy": calculate_rms_energy(segment_audio),
+            }
+        )
+
+    return segments
+
+
 def predict_window(model, labels, audio, input_shape, mean, std):
     """Predice la clase ganadora y su confianza para una ventana."""
     X = prepare_audio_for_model(audio, input_shape, mean, std)
@@ -277,34 +494,241 @@ def predict_window(model, labels, audio, input_shape, mean, std):
     return predicted_label, confidence
 
 
-def classify_window_state(label, confidence, threshold, last_accepted):
-    """Determina si la prediccion de una ventana entra a la secuencia final."""
+def classify_window_state(label, confidence, threshold, labels):
+    """Determina si una prediccion es candidata valida para confirmacion."""
     if confidence < threshold:
         return "BAJA_CONFIANZA", False
     if label == BACKGROUND_LABEL:
         return "RUIDO_IGNORADO", False
+    if label not in labels:
+        return "CLASE_INVALIDA_IGNORADO", False
+
+    return "CANDIDATO", True
+
+
+def group_candidates(candidates, confirmation_window):
+    """Agrupa candidatas cuyos inicios caen dentro de una ventana temporal."""
+    groups = []
+    current_group = []
+    current_start = None
+
+    for candidate in candidates:
+        if not current_group:
+            current_group = [candidate]
+            current_start = candidate["start"]
+            continue
+
+        if candidate["start"] - current_start <= confirmation_window:
+            current_group.append(candidate)
+            continue
+
+        groups.append(current_group)
+        current_group = [candidate]
+        current_start = candidate["start"]
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
+
+
+def summarize_candidate_group(group):
+    """Elige la clase dominante y calcula metricas de confirmacion del grupo."""
+    class_counts = {}
+    class_max_confidences = {}
+
+    for candidate in group:
+        label = candidate["label"]
+        confidence = candidate["confidence"]
+        class_counts[label] = class_counts.get(label, 0) + 1
+        class_max_confidences[label] = max(
+            class_max_confidences.get(label, 0.0),
+            confidence,
+        )
+
+    chosen_label = max(
+        class_counts,
+        key=lambda label: (class_counts[label], class_max_confidences[label]),
+    )
+    max_confidence = max(candidate["confidence"] for candidate in group)
+
+    return {
+        "start": group[0]["start"],
+        "end": group[-1]["end"],
+        "label": chosen_label,
+        "confirmations": class_counts[chosen_label],
+        "max_confidence": max_confidence,
+        "rows": group,
+    }
+
+
+def confirm_candidate_groups(candidates, rows, args):
+    """Confirma grupos de candidatas y construye la secuencia final."""
+    sequence = []
+    confirmed_groups = []
+    last_accepted = None
+    last_accepted_time = None
+
+    for group in group_candidates(candidates, args.confirmation_window):
+        summary = summarize_candidate_group(group)
+        enough_confirmations = summary["confirmations"] >= args.min_confirmations
+        high_confidence = summary["max_confidence"] >= args.high_confidence_override
+
+        if not (enough_confirmations or high_confidence):
+            for row in summary["rows"]:
+                rows[row["row_index"]]["state"] = "CONFIRMACION_INSUFICIENTE"
+            continue
+
+        if (
+            last_accepted_time is not None
+            and summary["start"] - last_accepted_time < args.min_command_gap
+        ):
+            for row in summary["rows"]:
+                rows[row["row_index"]]["state"] = "GAP_CORTO_IGNORADO"
+            continue
+
+        if summary["label"] == last_accepted:
+            for row in summary["rows"]:
+                rows[row["row_index"]]["state"] = "REPETIDO_IGNORADO"
+            continue
+
+        sequence.append(summary["label"])
+        last_accepted = summary["label"]
+        last_accepted_time = summary["start"]
+        confirmed_groups.append(summary)
+
+        for row in summary["rows"]:
+            rows[row["row_index"]]["state"] = "ACEPTADO"
+
+    return sequence, confirmed_groups
+
+
+def run_sequence_inference(model, labels, mean, std, input_shape, audio, args):
+    """Ejecuta inferencia por ventanas y construye la secuencia final."""
+    rows = []
+    candidates = []
+    windows = list(iter_windows(audio, args.window_duration, args.hop_duration))
+    window_energies = [calculate_rms_energy(window_audio) for _, _, window_audio in windows]
+    energy_threshold = (
+        estimate_energy_threshold(window_energies)
+        if args.auto_energy
+        else args.energy_threshold
+    )
+
+    if args.auto_energy:
+        print(f"Umbral RMS automatico: {energy_threshold:.6f}")
+
+    for (start_time, end_time, window_audio), energy in zip(windows, window_energies):
+        if energy < energy_threshold:
+            rows.append(
+                {
+                    "start": start_time,
+                    "end": end_time,
+                    "label": "SIN_CLASIFICAR",
+                    "confidence": 0.0,
+                    "energy": energy,
+                    "state": "ENERGIA_BAJA_IGNORADO",
+                }
+            )
+            continue
+
+        label, confidence = predict_window(model, labels, window_audio, input_shape, mean, std)
+        state, accepted = classify_window_state(
+            label,
+            confidence,
+            args.threshold,
+            labels,
+        )
+
+        rows.append(
+            {
+                "start": start_time,
+                "end": end_time,
+                "label": label,
+                "confidence": confidence,
+                "energy": energy,
+                "state": state,
+            }
+        )
+        if accepted:
+            candidates.append(
+                {
+                    "row_index": len(rows) - 1,
+                    "start": start_time,
+                    "end": end_time,
+                    "label": label,
+                    "confidence": confidence,
+                }
+            )
+
+    sequence, confirmed_groups = confirm_candidate_groups(candidates, rows, args)
+    return rows, sequence, confirmed_groups
+
+
+def classify_segment_state(label, confidence, threshold, labels, last_accepted):
+    """Determina si una prediccion de segmento entra a la secuencia final."""
+    if confidence < threshold:
+        return "BAJA_CONFIANZA", False
+    if label == BACKGROUND_LABEL:
+        return "RUIDO_IGNORADO", False
+    if label not in labels:
+        return "CLASE_INVALIDA_IGNORADO", False
     if label == last_accepted:
         return "REPETIDO_IGNORADO", False
 
     return "ACEPTADO", True
 
 
-def run_sequence_inference(model, labels, mean, std, input_shape, audio, args):
-    """Ejecuta inferencia por ventanas y construye la secuencia final."""
+def extract_segment_with_padding(audio, segment, padding, sample_rate):
+    """Extrae el segmento detectado agregando contexto a ambos lados."""
+    padding_samples = int(round(padding * sample_rate))
+    start_sample = max(0, segment["start_sample"] - padding_samples)
+    end_sample = min(len(audio), segment["end_sample"] + padding_samples)
+    return audio[start_sample:end_sample]
+
+
+def run_vad_sequence_inference(model, labels, mean, std, input_shape, audio, args):
+    """Segmenta por energia y clasifica cada segmento completo."""
     rows = []
     sequence = []
     last_accepted = None
+    energy_threshold = (
+        estimate_frame_energy_threshold(audio, SAMPLE_RATE)
+        if args.auto_energy
+        else args.energy_threshold
+    )
 
-    for start_time, end_time, window_audio in iter_windows(
+    if args.auto_energy:
+        print(f"Umbral RMS automatico: {energy_threshold:.6f}")
+
+    segments = segment_audio_by_energy(
         audio,
-        args.window_duration,
-        args.hop_duration,
-    ):
-        label, confidence = predict_window(model, labels, window_audio, input_shape, mean, std)
-        state, accepted = classify_window_state(
+        SAMPLE_RATE,
+        energy_threshold,
+        args.min_segment_duration,
+        args.min_silence_duration,
+    )
+
+    for segment in segments:
+        segment_audio = extract_segment_with_padding(
+            audio,
+            segment,
+            args.segment_padding,
+            SAMPLE_RATE,
+        )
+        label, confidence = predict_window(
+            model,
+            labels,
+            segment_audio,
+            input_shape,
+            mean,
+            std,
+        )
+        state, accepted = classify_segment_state(
             label,
             confidence,
             args.threshold,
+            labels,
             last_accepted,
         )
 
@@ -314,10 +738,12 @@ def run_sequence_inference(model, labels, mean, std, input_shape, audio, args):
 
         rows.append(
             {
-                "start": start_time,
-                "end": end_time,
+                "start": segment["start"],
+                "end": segment["end"],
+                "duration": segment["duration"],
                 "label": label,
                 "confidence": confidence,
+                "energy": segment["energy"],
                 "state": state,
             }
         )
@@ -327,18 +753,56 @@ def run_sequence_inference(model, labels, mean, std, input_shape, audio, args):
 
 def print_window_table(rows):
     """Muestra una tabla compacta de predicciones por ventana."""
-    headers = ("tiempo_inicio", "tiempo_fin", "clase_predicha", "confianza", "estado")
+    headers = (
+        "tiempo_inicio",
+        "tiempo_fin",
+        "clase_predicha",
+        "confianza",
+        "energia_rms",
+        "estado",
+    )
     print()
     print(
         f"{headers[0]:>13}  {headers[1]:>10}  "
-        f"{headers[2]:<18}  {headers[3]:>10}  {headers[4]}"
+        f"{headers[2]:<18}  {headers[3]:>10}  {headers[4]:>11}  {headers[5]}"
     )
-    print("-" * 72)
+    print("-" * 86)
 
     for row in rows:
         print(
             f"{row['start']:>13.2f}  {row['end']:>10.2f}  "
-            f"{row['label']:<18}  {row['confidence']:>10.4f}  {row['state']}"
+            f"{row['label']:<18}  {row['confidence']:>10.4f}  "
+            f"{row['energy']:>11.6f}  {row['state']}"
+        )
+
+
+def print_segment_table(rows):
+    """Muestra una tabla compacta de predicciones por segmento de voz."""
+    headers = (
+        "tiempo_inicio",
+        "tiempo_fin",
+        "duracion",
+        "clase_predicha",
+        "confianza",
+        "energia_rms",
+        "estado",
+    )
+    print()
+    print(
+        f"{headers[0]:>13}  {headers[1]:>10}  {headers[2]:>8}  "
+        f"{headers[3]:<18}  {headers[4]:>10}  {headers[5]:>11}  {headers[6]}"
+    )
+    print("-" * 98)
+
+    if not rows:
+        print("(sin segmentos de voz detectados)")
+        return
+
+    for row in rows:
+        print(
+            f"{row['start']:>13.2f}  {row['end']:>10.2f}  "
+            f"{row['duration']:>8.2f}  {row['label']:<18}  "
+            f"{row['confidence']:>10.4f}  {row['energy']:>11.6f}  {row['state']}"
         )
 
 
@@ -350,6 +814,35 @@ def print_sequence(sequence):
         print(" -> ".join(sequence))
     else:
         print("Secuencia final detectada: (sin comandos)")
+
+
+def print_confirmed_groups(groups):
+    """Muestra los grupos que pasaron la confirmacion temporal."""
+    print()
+    print("Grupos confirmados:")
+    if not groups:
+        print("(sin grupos confirmados)")
+        return
+
+    headers = (
+        "tiempo_inicio",
+        "tiempo_fin",
+        "clase_elegida",
+        "cantidad_confirmaciones",
+        "confianza_maxima",
+    )
+    print(
+        f"{headers[0]:>13}  {headers[1]:>10}  "
+        f"{headers[2]:<18}  {headers[3]:>24}  {headers[4]:>16}"
+    )
+    print("-" * 92)
+
+    for group in groups:
+        print(
+            f"{group['start']:>13.2f}  {group['end']:>10.2f}  "
+            f"{group['label']:<18}  {group['confirmations']:>24}  "
+            f"{group['max_confidence']:>16.4f}"
+        )
 
 
 def main():
@@ -373,8 +866,30 @@ def main():
     else:
         audio = record_audio(args.duration, device=args.device)
 
-    rows, sequence = run_sequence_inference(model, labels, mean, std, input_shape, audio, args)
-    print_window_table(rows)
+    if args.segmentation_mode == "windows":
+        rows, sequence, confirmed_groups = run_sequence_inference(
+            model,
+            labels,
+            mean,
+            std,
+            input_shape,
+            audio,
+            args,
+        )
+        print_window_table(rows)
+        print_confirmed_groups(confirmed_groups)
+    else:
+        rows, sequence = run_vad_sequence_inference(
+            model,
+            labels,
+            mean,
+            std,
+            input_shape,
+            audio,
+            args,
+        )
+        print_segment_table(rows)
+
     print_sequence(sequence)
 
 

@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import librosa
@@ -31,6 +32,8 @@ DEFAULT_DURATION = 6.0
 DEFAULT_WINDOW_DURATION = 2.0
 DEFAULT_HOP_DURATION = 0.75
 DEFAULT_THRESHOLD = 0.60
+DEFAULT_ESP32_PORT = "COM4"
+DEFAULT_COMMAND_DELAY = 0.50
 DEFAULT_ENERGY_THRESHOLD = 0.003
 DEFAULT_SEGMENTATION_MODE = "vad"
 DEFAULT_MIN_SEGMENT_DURATION = 0.35
@@ -183,6 +186,25 @@ def parse_args():
         default=None,
         help="Archivo WAV para probar una frase grabada sin usar microfono.",
     )
+    parser.add_argument(
+        "--send-esp32",
+        action="store_true",
+        help="Envia la secuencia detectada a la ESP32 por Bluetooth clasico.",
+    )
+    parser.add_argument(
+        "--esp32-port",
+        default=DEFAULT_ESP32_PORT,
+        help=f"Puerto COM de la ESP32. Default: {DEFAULT_ESP32_PORT}",
+    )
+    parser.add_argument(
+        "--command-delay",
+        type=float,
+        default=DEFAULT_COMMAND_DELAY,
+        help=(
+            "Espera entre comandos enviados a la ESP32 en segundos. "
+            f"Default: {DEFAULT_COMMAND_DELAY}"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -212,6 +234,38 @@ def validate_args(args):
         raise ValueError("--confirmation-window no puede ser negativo.")
     if not 0 <= args.high_confidence_override <= 1:
         raise ValueError("--high-confidence-override debe estar entre 0 y 1.")
+    if args.command_delay < 0:
+        raise ValueError("--command-delay no puede ser negativo.")
+
+
+def build_default_args(**overrides):
+    """Construye argumentos por defecto para reutilizar inferencia desde la UI."""
+    args = argparse.Namespace(
+        duration=DEFAULT_DURATION,
+        window_duration=DEFAULT_WINDOW_DURATION,
+        hop_duration=DEFAULT_HOP_DURATION,
+        threshold=DEFAULT_THRESHOLD,
+        segmentation_mode=DEFAULT_SEGMENTATION_MODE,
+        energy_threshold=DEFAULT_ENERGY_THRESHOLD,
+        min_segment_duration=DEFAULT_MIN_SEGMENT_DURATION,
+        min_silence_duration=DEFAULT_MIN_SILENCE_DURATION,
+        segment_padding=DEFAULT_SEGMENT_PADDING,
+        auto_energy=False,
+        min_command_gap=DEFAULT_MIN_COMMAND_GAP,
+        min_confirmations=DEFAULT_MIN_CONFIRMATIONS,
+        confirmation_window=DEFAULT_CONFIRMATION_WINDOW,
+        high_confidence_override=DEFAULT_HIGH_CONFIDENCE_OVERRIDE,
+        device=None,
+        list_devices=False,
+        audio_file=None,
+        send_esp32=False,
+        esp32_port=DEFAULT_ESP32_PORT,
+        command_delay=DEFAULT_COMMAND_DELAY,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    validate_args(args)
+    return args
 
 
 def parse_device(device):
@@ -816,6 +870,86 @@ def print_sequence(sequence):
         print("Secuencia final detectada: (sin comandos)")
 
 
+def send_sequence_to_esp32(sequence, port, command_delay):
+    """Envia comandos detectados a la ESP32 en el mismo orden."""
+    from src.hardware.esp32_bluetooth_controller import ESP32BluetoothController
+
+    commands = [command for command in sequence if command != BACKGROUND_LABEL]
+    if not commands:
+        print("ESP32: no hay comandos validos para enviar.")
+        return
+
+    controller = None
+    try:
+        controller = ESP32BluetoothController(port=port)
+        for index, command in enumerate(commands):
+            controller.send_command(command)
+            for response in controller.read_responses():
+                print(f"Respuesta ESP32: {response}")
+            if index < len(commands) - 1 and command_delay > 0:
+                time.sleep(command_delay)
+    except ConnectionError as exc:
+        print(f"Error ESP32: {exc}")
+    finally:
+        if controller is not None:
+            controller.close()
+
+
+def load_inference_resources():
+    """Carga modelo, etiquetas y parametros para reutilizarlos desde la UI."""
+    model = load_model(MODEL_PATH)
+    labels = load_labels(LABELS_PATH)
+    mean, std = load_preprocess_params(PREPROCESS_PARAMS_PATH)
+    input_shape = get_model_input_shape(model)
+    validate_model_outputs(model, labels)
+    return model, labels, mean, std, input_shape
+
+
+def run_sequence_live_inference(args, resources=None):
+    """Graba o carga audio largo y devuelve la secuencia detectada."""
+    if resources is None:
+        resources = load_inference_resources()
+
+    model, labels, mean, std, input_shape = resources
+    if args.audio_file is not None:
+        audio = load_wav_audio(args.audio_file)
+        print(f"Audio cargado: {args.audio_file} ({len(audio) / SAMPLE_RATE:.2f} s)")
+    else:
+        audio = record_audio(args.duration, device=args.device)
+
+    confirmed_groups = None
+    if args.segmentation_mode == "windows":
+        rows, sequence, confirmed_groups = run_sequence_inference(
+            model,
+            labels,
+            mean,
+            std,
+            input_shape,
+            audio,
+            args,
+        )
+        print_window_table(rows)
+        print_confirmed_groups(confirmed_groups)
+    else:
+        rows, sequence = run_vad_sequence_inference(
+            model,
+            labels,
+            mean,
+            std,
+            input_shape,
+            audio,
+            args,
+        )
+        print_segment_table(rows)
+
+    print_sequence(sequence)
+    return {
+        "rows": rows,
+        "sequence": sequence,
+        "confirmed_groups": confirmed_groups,
+    }
+
+
 def print_confirmed_groups(groups):
     """Muestra los grupos que pasaron la confirmacion temporal."""
     print()
@@ -854,43 +988,10 @@ def main():
 
     validate_args(args)
 
-    model = load_model(MODEL_PATH)
-    labels = load_labels(LABELS_PATH)
-    mean, std = load_preprocess_params(PREPROCESS_PARAMS_PATH)
-    input_shape = get_model_input_shape(model)
-    validate_model_outputs(model, labels)
-
-    if args.audio_file is not None:
-        audio = load_wav_audio(args.audio_file)
-        print(f"Audio cargado: {args.audio_file} ({len(audio) / SAMPLE_RATE:.2f} s)")
-    else:
-        audio = record_audio(args.duration, device=args.device)
-
-    if args.segmentation_mode == "windows":
-        rows, sequence, confirmed_groups = run_sequence_inference(
-            model,
-            labels,
-            mean,
-            std,
-            input_shape,
-            audio,
-            args,
-        )
-        print_window_table(rows)
-        print_confirmed_groups(confirmed_groups)
-    else:
-        rows, sequence = run_vad_sequence_inference(
-            model,
-            labels,
-            mean,
-            std,
-            input_shape,
-            audio,
-            args,
-        )
-        print_segment_table(rows)
-
-    print_sequence(sequence)
+    result = run_sequence_live_inference(args)
+    sequence = result["sequence"]
+    if args.send_esp32:
+        send_sequence_to_esp32(sequence, args.esp32_port, args.command_delay)
 
 
 if __name__ == "__main__":

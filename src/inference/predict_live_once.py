@@ -25,7 +25,9 @@ from src.features.audio_features import (  # noqa: E402
 MODEL_PATH = PROJECT_ROOT / "models" / "command_cnn.keras"
 PREPROCESS_PARAMS_PATH = PROJECT_ROOT / "models" / "preprocess_params.npz"
 LABELS_PATH = PROJECT_ROOT / "models" / "labels.json"
+BACKGROUND_LABEL = "RUIDO_FONDO"
 DEFAULT_THRESHOLD = 0.70
+DEFAULT_ESP32_PORT = "COM4"
 
 
 def parse_args():
@@ -44,6 +46,16 @@ def parse_args():
         type=float,
         default=DEFAULT_THRESHOLD,
         help=f"Confianza minima para aceptar la prediccion. Default: {DEFAULT_THRESHOLD}",
+    )
+    parser.add_argument(
+        "--send-esp32",
+        action="store_true",
+        help="Envia la clase predicha a la ESP32 por Bluetooth clasico.",
+    )
+    parser.add_argument(
+        "--esp32-port",
+        default=DEFAULT_ESP32_PORT,
+        help=f"Puerto COM de la ESP32. Default: {DEFAULT_ESP32_PORT}",
     )
     return parser.parse_args()
 
@@ -85,6 +97,14 @@ def load_preprocess_params(params_path):
     return mean, std
 
 
+def load_model(model_path):
+    """Carga el modelo Keras entrenado."""
+    if not model_path.exists():
+        raise FileNotFoundError(f"No existe el modelo entrenado: {model_path}")
+
+    return keras.models.load_model(model_path)
+
+
 def get_model_input_shape(model):
     """Devuelve la forma de entrada esperada sin el eje de batch."""
     input_shape = model.input_shape
@@ -101,6 +121,29 @@ def get_model_input_shape(model):
         raise ValueError(f"El script espera un canal, pero el modelo usa {channels}.")
 
     return int(n_mels), int(frames), int(channels)
+
+
+def validate_model_outputs(model, labels):
+    """Comprueba que la salida del modelo coincida con las etiquetas."""
+    output_shape = model.output_shape
+    if isinstance(output_shape, list):
+        output_shape = output_shape[0]
+
+    if output_shape[-1] != len(labels):
+        raise ValueError(
+            "La cantidad de etiquetas no coincide con la salida del modelo: "
+            f"{len(labels)} etiquetas vs {output_shape[-1]} salidas."
+        )
+
+
+def load_inference_resources():
+    """Carga modelo, etiquetas y parametros para reutilizarlos desde la UI."""
+    model = load_model(MODEL_PATH)
+    labels = load_labels(LABELS_PATH)
+    mean, std = load_preprocess_params(PREPROCESS_PARAMS_PATH)
+    input_shape = get_model_input_shape(model)
+    validate_model_outputs(model, labels)
+    return model, labels, mean, std, input_shape
 
 
 def record_audio(duration):
@@ -165,29 +208,63 @@ def print_prediction(labels, probabilities, threshold):
     for index in top_indices:
         print(f"  {labels[int(index)]}: {float(probabilities[int(index)]):.4f}")
 
+    return predicted_label, confidence
+
+
+def send_command_to_esp32(command, port):
+    """Envia un comando a la ESP32 y muestra sus respuestas."""
+    from src.hardware.esp32_bluetooth_controller import ESP32BluetoothController
+
+    controller = None
+    try:
+        controller = ESP32BluetoothController(port=port)
+        controller.send_command(command)
+        for response in controller.read_responses():
+            print(f"Respuesta ESP32: {response}")
+    except ConnectionError as exc:
+        print(f"Error ESP32: {exc}")
+    finally:
+        if controller is not None:
+            controller.close()
+
+
+def run_live_once_inference(duration, threshold, resources=None):
+    """Graba audio corto y devuelve la prediccion sin enviar a hardware."""
+    if resources is None:
+        resources = load_inference_resources()
+
+    model, labels, mean, std, input_shape = resources
+    audio = record_audio(duration)
+    X = prepare_audio_for_model(audio, input_shape, mean, std)
+    probabilities = model.predict(X, verbose=0)[0]
+    predicted_label, confidence = print_prediction(labels, probabilities, threshold)
+
+    return {
+        "label": predicted_label,
+        "confidence": confidence,
+        "probabilities": probabilities,
+        "accepted": confidence >= threshold and predicted_label != BACKGROUND_LABEL,
+    }
+
 
 def main():
     args = parse_args()
     validate_args(args)
 
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"No existe el modelo entrenado: {MODEL_PATH}")
+    result = run_live_once_inference(args.duration, args.threshold)
+    predicted_label = result["label"]
+    confidence = result["confidence"]
 
-    model = keras.models.load_model(MODEL_PATH)
-    labels = load_labels(LABELS_PATH)
-    mean, std = load_preprocess_params(PREPROCESS_PARAMS_PATH)
-    input_shape = get_model_input_shape(model)
-
-    if model.output_shape[-1] != len(labels):
-        raise ValueError(
-            "La cantidad de etiquetas no coincide con la salida del modelo: "
-            f"{len(labels)} etiquetas vs {model.output_shape[-1]} salidas."
-        )
-
-    audio = record_audio(args.duration)
-    X = prepare_audio_for_model(audio, input_shape, mean, std)
-    probabilities = model.predict(X, verbose=0)[0]
-    print_prediction(labels, probabilities, args.threshold)
+    if (
+        args.send_esp32
+        and confidence >= args.threshold
+        and predicted_label != BACKGROUND_LABEL
+    ):
+        send_command_to_esp32(predicted_label, args.esp32_port)
+    elif args.send_esp32 and predicted_label == BACKGROUND_LABEL:
+        print("ESP32: RUIDO_FONDO ignorado, no se envia comando.")
+    elif args.send_esp32:
+        print("ESP32: prediccion bajo el umbral, no se envia comando.")
 
 
 if __name__ == "__main__":
